@@ -1,0 +1,94 @@
+version: '3.9'
+
+services:
+  db:
+    image: tpi-devops-grupo-3-db:1.0 
+    container_name: tp_db
+    restart: unless-stopped 
+    env_file:
+      - .env
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 3s
+      retries: 4
+    networks:
+      - app-network
+  
+  api:
+    image: tpi-devops-grupo-3-api:1.0
+    container_name: tp_api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:  
+      MYSQL_HOST: db
+      MYSQL_PORT: 3306 
+    # El healthcheck de la API debe estar en su Dockerfile, pero lo replicamos acá para visibilidad
+    # test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5000/healthz || exit 1"] 
+    expose:
+      - "5000" 
+    networks:
+      - app-network
+  
+  data_api:
+    image: tpi-devops-grupo-3-data:1.0
+    container_name: tp_data_api
+    restart: unless-stopped
+    environment:
+      ALLOWED_ORIGINS: ""
+      PORT: "8000"
+      DATA_PATH: "/app/data/items.json"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/healthz || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    # Mantenemos las opciones de seguridad que ya tenías
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    networks:
+      - app-network
+
+  frontend:
+    # Ahora la imagen se construye localmente con el Dockerfile actualizado que incluye SSL/TLS
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    image: tpi-devops-grupo-3-web:1.0
+    container_name: tp_frontend
+    restart: unless-stopped
+    depends_on:
+      # Ya no es solo la API, el frontend depende de que ambos servicios estén arriba para el proxy
+      - api
+      - data_api
+    ports:
+      # Exponemos el puerto 443 (HTTPS) a la máquina host en el puerto 8080.
+      # ¡Ahora el acceso será https://localhost:8080/!
+      - "8080:443" 
+    networks:
+      - app-network
+
+
+volumes:
+  mysql_data:
+    driver: local
+
+networks:
+  app-network:
+    driver: bridge

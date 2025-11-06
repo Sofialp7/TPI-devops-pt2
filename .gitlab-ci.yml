@@ -1,0 +1,219 @@
+# TP Integrador 2025 - Parte 2: Pipeline de CI/CD para Microservicios
+
+# Definimos las etapas del pipeline
+# 1. Escaneos de seguridad (SAST/Secretos)
+# 2. Linting de código/Dockerfiles
+# 3. Build y Push a Registry
+# 4. Deploy final
+stages:
+  - secrets_scan
+  - linting
+  - build
+  - deploy
+
+# =========================================================================
+# Variables Globales
+# =========================================================================
+# Usamos dind (Docker In Docker) para las etapas de build/push
+variables:
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
+  # Prefijo para las imágenes en el LabSis Registry
+  FULL_IMAGE_NAME: $CI_REGISTRY_IMAGE
+
+# Definición del servicio DIND (necesario para la stage 'build')
+services:
+  - docker:dind
+
+# =========================================================================
+# STAGE 1: SECRETS SCAN (1.1 Seguridad en el Repositorio)
+# Utiliza detect-secrets para el escaneo estático de secretos
+# =========================================================================
+
+secrets_scan:
+  stage: secrets_scan
+  image: python:3.11-slim
+  script:
+    - pip install detect-secrets
+    # Excluye .env, logs, y archivos binarios
+    - detect-secrets scan --baseline .detect-secrets-baseline --exclude-files '(\.env|.*\.log|web/certs/nginx\.key|.*\.crt)' . > detect-secrets-report.txt
+    # Opcional: genera un artifact para ver el resultado
+  artifacts:
+    when: always
+    paths:
+      - detect-secrets-report.txt
+    expire_in: 1 week
+
+# =========================================================================
+# STAGE 2: LINTING & SAST (1.2 Escaneo de Código y 1.4 Escaneo de Docker)
+# Incluye Checkov (IaC/Dockerfiles) y un linter de código (Flake8 para Python)
+# =========================================================================
+
+.sast_template: &sast_definition
+  image: 
+    # Imagen que contenga todas las herramientas necesarias (Checkov, Flake8/Linters)
+    # Aquí se recomienda usar una imagen Docker personalizada o multi-job. 
+    # Usaremos Python + una imagen Docker para los escaneos.
+    name: registry.gitlab.com/gitlab-org/security-products/sast/sast-python
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - $CI_PROJECT_DIR/docs/*-report.html
+      - $CI_PROJECT_DIR/docs/*-report.json
+    expire_in: 1 week
+
+# --------------------------------------------------
+# 2.1: LINTING DE DOCKERFILES (Checkov)
+# --------------------------------------------------
+checkov_docker_lint:
+  stage: linting
+  image:
+    name: bridgecrew/checkov:latest
+    entrypoint: ["/usr/bin/env", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  script:
+    - mkdir -p docs
+    # Escanea todos los Dockerfiles y docker-compose
+    - checkov -d . --framework dockerfile,docker_compose --output json > docs/checkov-report.json
+    - checkov -d . --framework dockerfile,docker_compose --output cli
+    # No genera HTML nativo, pero el JSON es un buen artefacto
+  artifacts:
+    when: always
+    paths:
+      - docs/checkov-report.json
+    expire_in: 1 week
+
+# --------------------------------------------------
+# 2.2: LINTING DE CÓDIGO (Flake8 para API y DATA-API)
+# --------------------------------------------------
+lint_api_code:
+  stage: linting
+  image: python:3.11-slim
+  script:
+    - pip install flake8
+    # Asumiendo que el código de la API está en 'api/'
+    - flake8 api/ --count --max-complexity=10 --max-line-length=120 --statistics
+  allow_failure: true # Permitir que el pipeline continúe si hay warnings de linting
+
+lint_dataapi_code:
+  stage: linting
+  image: python:3.11-slim
+  script:
+    - pip install flake8
+    # Asumiendo que el código de la Data API está en 'data-api/'
+    - flake8 data-api/ --count --max-complexity=10 --max-line-length=120 --statistics
+  allow_failure: true
+
+# =========================================================================
+# STAGE 3: BUILD, SCAN & PUSH (1.3 Build, 1.4 Escaneo Estático)
+# Utilizamos Trivy para escanear las imágenes antes del push.
+# =========================================================================
+
+.build_scan_push_template: &build_scan_push_definition
+  stage: build
+  image: docker:latest
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - mkdir -p docs
+    # Construir la imagen
+    - docker build --pull -t "$FULL_IMAGE_NAME/$SERVICE_NAME:$CI_COMMIT_SHORT_SHA" -f "$SERVICE_PATH/Dockerfile" "$SERVICE_PATH"
+    
+    # Escaneo de vulnerabilidades con Trivy (1.4 Escaneo Estático)
+    - echo "Iniciando escaneo de Trivy para $SERVICE_NAME..."
+    - TRIVY_SEVERITIES="CRITICAL,HIGH,MEDIUM,LOW"
+    - TRIVY_OUTPUT="docs/trivy-$SERVICE_NAME-report.json"
+    
+    # Comando de Trivy para escaneo de vulnerabilidades con output JSON
+    - |
+      trivy image --severity $TRIVY_SEVERITIES --format json \
+      -o $TRIVY_OUTPUT \
+      "$FULL_IMAGE_NAME/$SERVICE_NAME:$CI_COMMIT_SHORT_SHA" || true # Permitimos que falle para evitar bloquear el pipeline
+      
+    # Push de la imagen al Registry LabSis
+    - docker push "$FULL_IMAGE_NAME/$SERVICE_NAME:$CI_COMMIT_SHORT_SHA"
+    - docker tag "$FULL_IMAGE_NAME/$SERVICE_NAME:$CI_COMMIT_SHORT_SHA" "$FULL_IMAGE_NAME/$SERVICE_NAME:latest"
+    - docker push "$FULL_IMAGE_NAME/$SERVICE_NAME:latest"
+  artifacts:
+    when: always
+    paths:
+      - docs/trivy-*.json
+    expire_in: 1 week
+  dependencies:
+    - checkov_docker_lint # Aseguramos que el linting de Dockerfiles haya pasado (o al menos corrido)
+  tags:
+    - dind # Asegurar que este job corra en un runner con soporte DIND (Docker in Docker)
+
+build_db:
+  <<: *build_scan_push_definition
+  variables:
+    SERVICE_NAME: db
+    SERVICE_PATH: db
+
+build_api:
+  <<: *build_scan_push_definition
+  variables:
+    SERVICE_NAME: api
+    SERVICE_PATH: api
+  dependencies:
+    - lint_api_code
+
+build_data_api:
+  <<: *build_scan_push_definition
+  variables:
+    SERVICE_NAME: data_api
+    SERVICE_PATH: data-api
+  dependencies:
+    - lint_dataapi_code
+
+build_frontend:
+  <<: *build_scan_push_definition
+  variables:
+    SERVICE_NAME: web
+    SERVICE_PATH: web
+
+# =========================================================================
+# STAGE 4: DEPLOY (1.5 Deploy)
+# Despliegue en el servidor remoto usando SSH.
+# =========================================================================
+
+deploy_server:
+  stage: deploy
+  image: alpine/ssh-client:latest
+  before_script:
+    - mkdir -p ~/.ssh
+    # Uso de la variable de GitLab CI/CD para la clave privada (NO hardcodeada)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+  script:
+    # 1. Copiar los archivos necesarios para el deploy (docker-compose, .env)
+    - ssh $SSH_USER@$SSH_HOST "mkdir -p /opt/$CI_PROJECT_NAME"
+    - scp docker-compose.yml .env $SSH_USER@$SSH_HOST:/opt/$CI_PROJECT_NAME/
+    
+    # 2. Iniciar el despliegue con la nueva imagen (Pull y Up)
+    - |
+      ssh $SSH_USER@$SSH_HOST << EOF
+        cd /opt/$CI_PROJECT_NAME
+        # Pull de las últimas imágenes tageadas como :latest
+        docker compose pull db api data_api web
+        
+        # Despliegue de los contenedores
+        # Usamos -d para detached y --force-recreate para asegurar la actualización
+        docker compose up -d --force-recreate
+        
+        # Verificar que los contenedores estén corriendo (1.5)
+        echo "Verificación de Contenedores en ejecución:"
+        docker compose ps
+      EOF
+  environment:
+    name: production
+    url: https://$SSH_HOST:8080
+  # Este job depende de que todas las imágenes se hayan construido y pusheado
+  dependencies:
+    - build_db
+    - build_api
+    - build_data_api
+    - build_frontend
+  only:
+    - main # Solo se ejecuta el deploy en la rama principal
